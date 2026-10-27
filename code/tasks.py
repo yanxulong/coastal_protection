@@ -31,3 +31,11 @@ def download_coastal_dem_inputs(*args, **kwargs):
     from functions import download_coastal_dem_inputs as _download
     config = args[0] if args else kwargs.get("config")
     return _download(config=config)
+
+
+
+def download_all_ccap_vintages(*args, **kwargs):
+    """Pipeline task: download all available CONUS C-CAP land-cover vintages."""
+    from functions import download_all_ccap_vintages as _download
+    config = args[0] if args else kwargs.get("config")
+    return _download(config=config)

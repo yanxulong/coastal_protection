@@ -654,3 +654,230 @@ def download_coastal_dem_inputs(config=None, project_root=None, dem_root=None):
     total_downloaded = sum(r["bytes"] for r in tile_records)
     print(f"[done] DEM tiles: {len(tile_records)} ({total_downloaded:,} bytes); land mask: {mask_path}; manifest: {manifest_path}", flush=True)
     return manifest
+
+
+
+def download_all_ccap_vintages(config=None, project_root=None, output_root=None):
+    """Download every available NOAA CONUS C-CAP regional land-cover vintage.
+
+    Fetches each listed GeoTIFF and available metadata companions. When rasterio
+    is installed, also writes per-vintage binary masks: 1=non-open-water land,
+    0=C-CAP class 21 Open Water, 255=NoData. Native grids remain unwarped.
+    """
+    import hashlib
+    import json
+    import os
+    import re
+    import shutil
+    import time
+    from datetime import datetime, timezone
+    from html.parser import HTMLParser
+    from pathlib import Path
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urljoin
+    from urllib.request import Request, urlopen
+
+    class Links(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.hrefs = set()
+        def handle_starttag(self, tag, attrs):
+            if tag.lower() == "a":
+                href = dict(attrs).get("href")
+                if href:
+                    self.hrefs.add(href)
+
+    if project_root is None and config is not None:
+        project_root = getattr(config, "project_root", None)
+        if project_root is None and isinstance(config, (str, os.PathLike)):
+            project_root = config
+    project_root = Path(
+        project_root or os.environ.get("COASTAL_PROTECTION_PROJECT_ROOT")
+        or Path(__file__).resolve().parent.parent
+    ).expanduser().resolve()
+    output_root = Path(
+        output_root or os.environ.get("COASTAL_PROTECTION_CCAP_ROOT")
+        or project_root / "data/raw/ccap_30m_all_vintages"
+    ).expanduser().resolve()
+    raster_dir = output_root / "rasters"
+    metadata_dir = output_root / "metadata"
+    auxiliary_dir = output_root / "auxiliary"
+    mask_dir = output_root / "land_masks"
+    for folder in (raster_dir, metadata_dir, auxiliary_dir, mask_dir):
+        folder.mkdir(parents=True, exist_ok=True)
+
+    user_agent = "coastal-protection-research/1.0 NOAA C-CAP archive download"
+    base_url = "https://ocmgeodatastor1.blob.core.windows.net/ccap/bulk_download/C-CAP_Regional_30-meter_Data/C-CAP_Regional_Land_Cover_Classification/CONUS/"
+    listing_url = urljoin(base_url, "index.html")
+
+    def open_url(url, method="GET", headers=None, timeout=180):
+        request_headers = {"User-Agent": user_agent}
+        if headers:
+            request_headers.update(headers)
+        request = Request(url, headers=request_headers, method=method)
+        return urlopen(request, timeout=timeout)
+
+    def head_size(url):
+        try:
+            with open_url(url, method="HEAD") as response:
+                value = response.headers.get("Content-Length")
+                return int(value) if value else None
+        except Exception:
+            return None
+
+    def file_hash(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def fetch(url, destination, expected_size=None):
+        destination = Path(destination)
+        partial = destination.with_suffix(destination.suffix + ".part")
+        if destination.exists() and (expected_size is None or destination.stat().st_size == expected_size):
+            return {"path": str(destination), "bytes": destination.stat().st_size,
+                    "sha256": file_hash(destination), "status": "already_present"}
+        offset = partial.stat().st_size if partial.exists() else 0
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        try:
+            with open_url(url, headers=headers, timeout=300) as response:
+                append = offset > 0 and getattr(response, "status", 200) == 206
+                if not append:
+                    offset = 0
+                digest = hashlib.sha256()
+                if append:
+                    with partial.open("rb") as old:
+                        for chunk in iter(lambda: old.read(8 * 1024 * 1024), b""):
+                            digest.update(chunk)
+                mode = "ab" if append else "wb"
+                with partial.open(mode) as out:
+                    while True:
+                        chunk = response.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        digest.update(chunk)
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise RuntimeError(f"C-CAP download failed: {url}: {exc}") from exc
+        actual = partial.stat().st_size
+        if expected_size is not None and actual != expected_size:
+            raise RuntimeError(f"C-CAP size mismatch: {url}; expected {expected_size}, got {actual}; partial retained")
+        partial.replace(destination)
+        return {"path": str(destination), "bytes": actual,
+                "sha256": digest.hexdigest(), "status": "downloaded"}
+
+    with open_url(listing_url) as response:
+        html = response.read().decode("utf-8", errors="replace")
+    parser = Links()
+    parser.feed(html)
+    tif_names = sorted({
+        Path(href).name for href in parser.hrefs
+        if re.fullmatch(r"conus_\d{4}_ccap_landcover\.tif", Path(href).name, re.I)
+    })
+    if not tif_names:
+        raise RuntimeError(f"NOAA CONUS C-CAP listing had no matching land-cover GeoTIFFs: {listing_url}")
+    years = [int(re.search(r"(\d{4})", name).group(1)) for name in tif_names]
+    print(f"[ccap] NOAA listing: {len(tif_names)} vintages {years[0]}-{years[-1]}: {years}", flush=True)
+
+    inventory = []
+    for tif_name, year in zip(tif_names, years):
+        tif_url = urljoin(base_url, tif_name)
+        xml_name = tif_name[:-4] + ".xml"
+        aux_name = tif_name + ".aux.xml"
+        links_by_name = {Path(href).name for href in parser.hrefs}
+        companions = []
+        if xml_name in links_by_name:
+            companions.append(("metadata", xml_name, urljoin(base_url, xml_name), metadata_dir / xml_name))
+        if aux_name in links_by_name:
+            companions.append(("auxiliary", aux_name, urljoin(base_url, aux_name), auxiliary_dir / aux_name))
+        files = [("raster", tif_name, tif_url, raster_dir / tif_name)] + companions
+        file_entries = []
+        for kind, name, url, destination in files:
+            file_entries.append({
+                "kind": kind, "name": name, "url": url,
+                "destination": str(destination), "expected_bytes": head_size(url)
+            })
+        inventory.append({"year": year, "files": file_entries})
+
+    try:
+        import numpy as np
+        import rasterio
+        can_make_masks = True
+    except ImportError:
+        np = rasterio = None
+        can_make_masks = False
+        print("[ccap] rasterio/numpy unavailable; rasters will download, binary masks skipped", flush=True)
+
+    missing_bytes = sum(
+        entry["expected_bytes"] or 0
+        for vintage in inventory for entry in vintage["files"]
+        if not Path(entry["destination"]).exists()
+    )
+    mask_reserve = sum(
+        entry["expected_bytes"] or 0
+        for vintage in inventory for entry in vintage["files"]
+        if entry["kind"] == "raster"
+    ) if can_make_masks else 0
+    disk = shutil.disk_usage(output_root)
+    needed = missing_bytes + mask_reserve + 512_000_000
+    if disk.free < needed:
+        raise RuntimeError(f"Insufficient free space at {output_root}: estimated need {needed:,} bytes, free {disk.free:,}")
+
+    vintage_results = []
+    for vintage in inventory:
+        result = {"year": vintage["year"], "files": []}
+        tif_path = None
+        for entry in vintage["files"]:
+            saved = fetch(entry["url"], entry["destination"], entry["expected_bytes"])
+            record = {**entry, **saved}
+            result["files"].append(record)
+            if entry["kind"] == "raster":
+                tif_path = Path(entry["destination"])
+            print(f"[ccap] {vintage['year']} {entry['kind']}: {saved['status']} ({saved['bytes']:,} bytes)", flush=True)
+        result["mask"] = None
+        if can_make_masks and tif_path is not None:
+            mask_path = mask_dir / f"conus_{vintage['year']}_ccap_land_mask.tif"
+            if not mask_path.exists() or mask_path.stat().st_mtime < tif_path.stat().st_mtime:
+                with rasterio.open(tif_path) as source:
+                    profile = source.profile.copy()
+                    profile.update(driver="GTiff", count=1, dtype="uint8", nodata=255,
+                                   compress="deflate", predictor=2, tiled=True)
+                    with rasterio.open(mask_path, "w", **profile) as target:
+                        for _, window in source.block_windows(1):
+                            values = source.read(1, window=window)
+                            valid = (source.read_masks(1, window=window) > 0) & (values != 0)
+                            mask = np.full(values.shape, 255, dtype=np.uint8)
+                            mask[valid & (values == 21)] = 0
+                            mask[valid & (values != 21)] = 1
+                            target.write(mask, 1, window=window)
+            with rasterio.open(tif_path) as source:
+                native_resolution = [abs(float(v)) for v in source.res]
+                crs = str(source.crs)
+            result["mask"] = {
+                "path": str(mask_path), "bytes": mask_path.stat().st_size,
+                "sha256": file_hash(mask_path), "rule": "1=valid non-Open-Water class; 0=C-CAP class 21 Open Water; 255=NoData",
+                "native_resolution": native_resolution, "crs": crs
+            }
+        vintage_results.append(result)
+        time.sleep(0.1)
+
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source_page": "https://coast.noaa.gov/digitalcoast/data/ccapregional.html",
+        "source_directory": listing_url,
+        "product": "NOAA C-CAP Regional Land Cover Classification, CONUS",
+        "years_found_in_official_listing": years,
+        "vintage_count": len(years),
+        "notes": [
+            "Downloaded every CONUS land-cover GeoTIFF linked in NOAA directory at run time, plus listed XML and .tif.aux.xml companions.",
+            "No reprojection or resampling; each native raster grid and mapping footprint preserved.",
+            "Class 21 Open Water coded 0 in binary land mask; other valid classes, including wetlands 13-18, coded 1; NoData coded 255.",
+            "Native resolution recorded per vintage from raster metadata; do not assume all vintages share identical grid or resolution."
+        ],
+        "vintages": vintage_results
+    }
+    manifest_path = output_root / "ccap_all_conus_vintages_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[ccap-done] {len(years)} vintages; manifest: {manifest_path}", flush=True)
+    return manifest

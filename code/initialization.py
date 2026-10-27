@@ -132,3 +132,6 @@ def build_task_tree(project: LocalProjectFlow, config: dict[str, object]) -> Loc
 # Register coastal land-mask and NAVD88 3DEP download task.
 import tasks as _pipeline_tasks
 TASK_REGISTRY.setdefault("download_coastal_dem_inputs", _pipeline_tasks.download_coastal_dem_inputs)
+
+
+TASK_REGISTRY.setdefault("download_all_ccap_vintages", _pipeline_tasks.download_all_ccap_vintages)
