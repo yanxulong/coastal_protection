@@ -6,5 +6,5 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 git pull --ff-only origin master
 export COASTAL_PROTECTION_PROJECT_ROOT="$PROJECT_ROOT"
-export COASTAL_PROTECTION_DEM_ROOT="${COASTAL_PROTECTION_DEM_ROOT:-$PROJECT_ROOT/data/raw/usgs_3dep_13arcsec_dem}"
+export COASTAL_PROTECTION_DEM_ROOT="${COASTAL_PROTECTION_DEM_ROOT:-/scratch.global/yxlong/projects/coastal_protection/data/raw/usgs_3dep_13arcsec_dem}"
 python code/run.py --task download_coastal_dem_inputs
