@@ -451,19 +451,38 @@ def download_coastal_dem_inputs(config=None, project_root=None, dem_root=None):
     def get_json(url, params):
         return json.loads(get_bytes(url + "?" + urlencode(params)).decode("utf-8"))
 
-    def arcgis_features(layer_url, fields="*"):
+    def arcgis_features(layer_url, fields="*", batch_size=100):
         ids_result = get_json(layer_url + "/query", {
             "where": "1=1", "returnIdsOnly": "true", "f": "json"
         })
         ids = ids_result.get("objectIds") or []
+
+        def fetch_batch(batch):
+            try:
+                result = get_json(layer_url + "/query", {
+                    "objectIds": ",".join(map(str, batch)),
+                    "outFields": fields, "returnGeometry": "true", "outSR": "4326",
+                    "f": "geojson"
+                })
+                if result.get("error"):
+                    raise RuntimeError(f"ArcGIS query error: {result['error']}")
+                return result.get("features", [])
+            except Exception as exc:
+                if len(batch) == 1:
+                    raise RuntimeError(
+                        f"NOAA ArcGIS feature query failed for objectId {batch[0]}: {exc}"
+                    ) from exc
+                midpoint = len(batch) // 2
+                print(
+                    f"[noaa-arcgis] query failed for {len(batch)} features; "
+                    f"retrying as {midpoint} + {len(batch) - midpoint}: {exc}",
+                    flush=True,
+                )
+                return fetch_batch(batch[:midpoint]) + fetch_batch(batch[midpoint:])
+
         features = []
-        for start in range(0, len(ids), 100):
-            result = get_json(layer_url + "/query", {
-                "objectIds": ",".join(map(str, ids[start:start + 100])),
-                "outFields": fields, "returnGeometry": "true", "outSR": "4326",
-                "f": "geojson"
-            })
-            features.extend(result.get("features", []))
+        for start in range(0, len(ids), batch_size):
+            features.extend(fetch_batch(ids[start:start + batch_size]))
         return features
 
     def sha256(path):
