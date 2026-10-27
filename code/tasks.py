@@ -23,3 +23,11 @@ def prepare_msi_dem_download(project):
 def download_nhc_storm_tracks(project):
     """Download NHC storm tracks and wind-radius source files for the requested years."""
     return functions.download_nhc_storm_tracks(project)
+
+
+
+def download_coastal_dem_inputs(*args, **kwargs):
+    """Pipeline task: fetch NOAA shoreline land mask and USGS coastal DEM inputs."""
+    from functions import download_coastal_dem_inputs as _download
+    config = args[0] if args else kwargs.get("config")
+    return _download(config=config)

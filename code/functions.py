@@ -387,3 +387,270 @@ def download_nhc_storm_tracks(project) -> dict[str, object]:
         "gis_best_track_files": len(gis_files),
         "current_season_storm_count": len(current_year_files),
     }
+
+
+
+def download_coastal_dem_inputs(config=None, project_root=None, dem_root=None):
+    """Download NOAA coastal land-mask inputs and USGS 3DEP NAVD88 DEM tiles.
+
+    Downloads are raw, reproducibly catalogued inputs. Study geometry comes from
+    NOAA's 452-county shoreline layer, restricted to CONUS and excluding counties
+    intersecting NOAA Great Lakes waterbodies. DEM search uses 1-degree cells
+    intersecting those county bounds; this may include some non-study pixels.
+    """
+    import hashlib
+    import json
+    import math
+    import os
+    import shutil
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import urlencode, urlparse, unquote
+    from urllib.request import Request, urlopen
+
+    import numpy as np
+    import rasterio
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    if project_root is None and config is not None:
+        project_root = getattr(config, "project_root", None)
+        if project_root is None and isinstance(config, (str, os.PathLike)):
+            project_root = config
+    project_root = Path(
+        project_root
+        or os.environ.get("COASTAL_PROTECTION_PROJECT_ROOT")
+        or Path(__file__).resolve().parent.parent
+    ).expanduser().resolve()
+    dem_root = Path(
+        dem_root
+        or os.environ.get("COASTAL_PROTECTION_DEM_ROOT")
+        or project_root / "data/raw/usgs_3dep_13arcsec_dem"
+    ).expanduser().resolve()
+    dem_dir = dem_root / "tiles"
+    land_dir = dem_root / "land_mask"
+    dem_dir.mkdir(parents=True, exist_ok=True)
+    land_dir.mkdir(parents=True, exist_ok=True)
+
+    user_agent = "coastal-protection-research/1.0 (USGS TNM and NOAA public data)"
+
+    def get_bytes(url, timeout=180):
+        req = Request(url, headers={"User-Agent": user_agent})
+        last_error = None
+        for attempt in range(5):
+            try:
+                with urlopen(req, timeout=timeout) as response:
+                    return response.read()
+            except (HTTPError, URLError, TimeoutError) as exc:
+                last_error = exc
+                time.sleep(min(2 ** attempt, 20))
+        raise RuntimeError(f"Request failed after retries: {url}: {last_error}")
+
+    def get_json(url, params):
+        return json.loads(get_bytes(url + "?" + urlencode(params)).decode("utf-8"))
+
+    def arcgis_features(layer_url, fields="*"):
+        ids_result = get_json(layer_url + "/query", {
+            "where": "1=1", "returnIdsOnly": "true", "f": "json"
+        })
+        ids = ids_result.get("objectIds") or []
+        features = []
+        for start in range(0, len(ids), 100):
+            result = get_json(layer_url + "/query", {
+                "objectIds": ",".join(map(str, ids[start:start + 100])),
+                "outFields": fields, "returnGeometry": "true", "outSR": "4326",
+                "f": "geojson"
+            })
+            features.extend(result.get("features", []))
+        return features
+
+    def sha256(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def download(url, destination, expected_size=None):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() and (expected_size is None or destination.stat().st_size == expected_size):
+            return {"path": str(destination), "bytes": destination.stat().st_size,
+                    "sha256": sha256(destination), "status": "already_present"}
+        partial = destination.with_suffix(destination.suffix + ".part")
+        offset = partial.stat().st_size if partial.exists() else 0
+        headers = {"User-Agent": user_agent}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=300) as response:
+                append = offset > 0 and getattr(response, "status", 200) == 206
+                if not append:
+                    offset = 0
+                mode = "ab" if append else "wb"
+                with partial.open(mode) as out:
+                    while True:
+                        block = response.read(8 * 1024 * 1024)
+                        if not block:
+                            break
+                        out.write(block)
+        except Exception:
+            raise
+        actual = partial.stat().st_size
+        if expected_size is not None and actual != expected_size:
+            raise RuntimeError(f"Download size mismatch for {url}: expected {expected_size}, got {actual}; partial kept at {partial}")
+        partial.replace(destination)
+        return {"path": str(destination), "bytes": actual,
+                "sha256": sha256(destination), "status": "downloaded"}
+
+    county_layer = "https://www.coast.noaa.gov/arcgis/rest/services/Landcover/Coastal_County_Update_Review/MapServer/9"
+    great_lakes_layer = "https://www.coast.noaa.gov/arcgis/rest/services/Landcover/Coastal_County_Update_Review/MapServer/5"
+    county_features = arcgis_features(county_layer, "fips,st_abbr,cntyname")
+    lake_features = arcgis_features(great_lakes_layer, "*")
+    lake_geometries = [shape(f["geometry"]) for f in lake_features if f.get("geometry")]
+    great_lakes = unary_union(lake_geometries) if lake_geometries else None
+    non_conus = {"AK", "HI", "PR", "VI", "GU", "AS", "MP", "UM"}
+    kept = []
+    excluded_great_lakes_fips = []
+    county_geometries = []
+    for feature in county_features:
+        props = feature.get("properties", {})
+        state = str(props.get("st_abbr", "")).upper()
+        fips = str(props.get("fips", "")).zfill(5)
+        if state in non_conus or not feature.get("geometry"):
+            continue
+        geom = shape(feature["geometry"])
+        if great_lakes is not None and geom.intersects(great_lakes):
+            excluded_great_lakes_fips.append(fips)
+            continue
+        kept.append(feature)
+        county_geometries.append(geom)
+    if not kept:
+        raise RuntimeError("NOAA query returned no CONUS shoreline counties after Great Lakes exclusion")
+
+    boundary_path = dem_root / "noaa_shoreline_counties_conus_excluding_great_lakes.geojson"
+    boundary_payload = {
+        "type": "FeatureCollection", "name": "NOAA CONUS shoreline counties excluding Great Lakes",
+        "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
+        "features": kept
+    }
+    boundary_path.write_text(json.dumps(boundary_payload), encoding="utf-8")
+
+    # DEM 1/3 arc-second coverage is queried by one-degree cells intersecting
+    # county bounding boxes; exact pixel clipping is a later processing step.
+    cells = set()
+    for geom in county_geometries:
+        minx, miny, maxx, maxy = geom.bounds
+        minx, maxx = max(minx, -126.0), min(maxx, -65.0)
+        miny, maxy = max(miny, 23.0), min(maxy, 51.0)
+        if minx >= maxx or miny >= maxy:
+            continue
+        for lon in range(math.floor(minx), math.floor(maxx) + 1):
+            for lat in range(math.floor(miny), math.floor(maxy) + 1):
+                cells.add((lon, lat))
+
+    tnm_url = "https://tnmaccess.nationalmap.gov/api/v1/products"
+    dataset = "Digital Elevation Model (DEM) 1/3 arc-second"
+    products_by_url = {}
+    for index, (lon, lat) in enumerate(sorted(cells), start=1):
+        params = {
+            "datasets": dataset,
+            "bbox": f"{lon},{lat},{lon + 1},{lat + 1}",
+            "prodFormats": "GeoTIFF",
+            "max": 1000,
+            "outputFormat": "JSON"
+        }
+        try:
+            result = get_json(tnm_url, params)
+        except Exception as exc:
+            raise RuntimeError(f"USGS TNM query failed for 1-degree cell {lon},{lat}: {exc}") from exc
+        for item in result.get("items", []):
+            url = item.get("downloadURL")
+            if url:
+                products_by_url[url] = item
+        print(f"[dem-catalog] cell {index}/{len(cells)} ({lon},{lat}); unique tiles={len(products_by_url)}", flush=True)
+        time.sleep(0.15)
+    if not products_by_url:
+        raise RuntimeError("USGS TNM returned no 1/3 arc-second GeoTIFF products; check dataset name/API response")
+
+    products = sorted(products_by_url.values(), key=lambda x: x.get("downloadURL", ""))
+    total_known = sum(int(p.get("sizeInBytes") or 0) for p in products)
+    ccap_url = "https://ocmgeodatastor1.blob.core.windows.net/ccap/bulk_download/C-CAP_Regional_30-meter_Data/C-CAP_Regional_Land_Cover_Classification/CONUS/conus_2021_ccap_landcover.tif"
+    ccap_xml_url = ccap_url[:-4] + ".xml"
+    ccap_path = land_dir / "conus_2021_ccap_landcover.tif"
+    xml_path = land_dir / "conus_2021_ccap_landcover.xml"
+    mask_path = land_dir / "conus_2021_ccap_land_mask.tif"
+
+    disk = shutil.disk_usage(dem_root)
+    required = total_known + (ccap_path.stat().st_size if ccap_path.exists() else 700_000_000) + 500_000_000
+    if disk.free < required:
+        raise RuntimeError(f"Insufficient free space at {dem_root}: need about {required:,} bytes, have {disk.free:,}; set COASTAL_PROTECTION_DEM_ROOT to MSI scratch")
+
+    tile_records = []
+    for index, item in enumerate(products, start=1):
+        url = item["downloadURL"]
+        name = unquote(Path(urlparse(url).path).name) or f"3dep_13arcsec_{index:05d}.tif"
+        if not name.lower().endswith((".tif", ".tiff", ".zip")):
+            name += ".tif"
+        path = dem_dir / name
+        record = download(url, path, int(item["sizeInBytes"]) if item.get("sizeInBytes") else None)
+        record.update({
+            "title": item.get("title"), "sourceOriginId": item.get("sourceOriginId"),
+            "publicationDate": item.get("publicationDate"),
+            "lastUpdated": item.get("lastUpdated"), "downloadURL": url,
+            "vertical_datum": "NAVD88", "elevation_units": "meters",
+            "horizontal_datum": "NAD83"
+        })
+        tile_records.append(record)
+        print(f"[dem-download] tile {index}/{len(products)}: {name} ({record['status']})", flush=True)
+
+    ccap_record = download(ccap_url, ccap_path)
+    xml_record = download(ccap_xml_url, xml_path)
+    with rasterio.open(ccap_path) as source:
+        profile = source.profile.copy()
+        profile.update(driver="GTiff", count=1, dtype="uint8", nodata=255,
+                       compress="deflate", predictor=2, tiled=True)
+        with rasterio.open(mask_path, "w", **profile) as target:
+            for _, window in source.block_windows(1):
+                values = source.read(1, window=window)
+                valid = (source.read_masks(1, window=window) > 0) & (values != 0)
+                mask = np.full(values.shape, 255, dtype=np.uint8)
+                mask[valid & (values == 21)] = 0
+                mask[valid & (values != 21)] = 1
+                target.write(mask, 1, window=window)
+    mask_record = {"path": str(mask_path), "bytes": mask_path.stat().st_size,
+                   "sha256": sha256(mask_path), "status": "written",
+                   "rule": "valid C-CAP cells: 1=land, 0=class 21 Open Water, 255=NoData; wetland classes remain land"}
+
+    storm_manifests = sorted((project_root / "data/raw/nhc_storm_tracks").glob("snapshots/*/source_manifest.json"))
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "study_boundary": {
+            "path": str(boundary_path), "source": county_layer,
+            "source_description": "NOAA Coastal County Update Review, Original Shoreline Counties (2010 boundaries), 452-county definition layer",
+            "county_count": len(kept), "excluded_great_lakes_counties": sorted(set(excluded_great_lakes_fips)),
+            "great_lakes_source": great_lakes_layer, "crs": "EPSG:4326"
+        },
+        "storm_track_manifest": str(storm_manifests[-1]) if storm_manifests else None,
+        "dem": {
+            "dataset": dataset, "search_api": tnm_url, "candidate_1degree_cells": len(cells),
+            "tile_count": len(tile_records), "tiles": tile_records,
+            "horizontal_datum": "NAD83", "vertical_datum": "NAVD88",
+            "elevation_units": "meters", "resolution": "1/3 arc-second (approximately 10 m)",
+            "note": "Raw tiles selected by 1-degree cells intersecting shoreline-county bounding boxes; trim to exact study geometry before analysis."
+        },
+        "land_mask": {
+            "raster": ccap_record, "metadata": xml_record, "binary_mask": mask_record,
+            "source": ccap_url, "vintage": 2021, "native_resolution": "30 m",
+            "classification": "C-CAP class 21 is Open Water; valid non-water pixels, including wetland classes 13-18, are coded land.",
+            "alignment": "Keep native C-CAP grid; resample mask to DEM grids with nearest-neighbor only when needed."
+        }
+    }
+    manifest_path = dem_root / "coastal_dem_landmask_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    total_downloaded = sum(r["bytes"] for r in tile_records)
+    print(f"[done] DEM tiles: {len(tile_records)} ({total_downloaded:,} bytes); land mask: {mask_path}; manifest: {manifest_path}", flush=True)
+    return manifest
