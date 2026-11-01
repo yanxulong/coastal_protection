@@ -64,6 +64,310 @@ def audit_stormarea_inputs(project) -> dict[str, object]:
     return {"inputs": inputs, "missing": missing, "ready": not missing}
 
 
+def reconcile_noaa_storm_damage(project) -> dict[str, object]:
+    """Separate NOAA direct-county loss rows from unresolved zone/area rows.
+
+    This task never allocates forecast-zone damage to counties. Reviewed EVENT_ID
+    to storm_id matches are required before NOAA rows become county-storm totals.
+    """
+    import csv
+    import gzip
+    import re
+    from collections import Counter
+
+    import pandas as pd
+
+    source_dir = project.paths["storm_events_dir"]
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"NOAA Storm Events directory missing: {source_dir}")
+    source_files = sorted((*source_dir.rglob("*.csv"), *source_dir.rglob("*.csv.gz")))
+    if not source_files:
+        raise FileNotFoundError(f"No NOAA Storm Events CSV/CSV.GZ files under {source_dir}")
+
+    output_dir = project.paths["stormarea_output"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    direct_path = project.paths["noaa_direct_county_damage"]
+    unresolved_path = project.paths["noaa_unresolved_zone_damage"]
+    candidates_path = project.paths["storm_crosswalk_candidates"]
+    matched_path = project.paths["noaa_reviewed_county_storm_damage"]
+    manifest_path = project.paths["damage_reconciliation_manifest"]
+    years = range(2017, 2026)
+    direct_parts: list[pd.DataFrame] = []
+    unresolved_parts: list[pd.DataFrame] = []
+    candidate_parts: list[pd.DataFrame] = []
+    required = {"EVENT_ID", "CZ_TYPE", "CZ_FIPS", "STATE_FIPS", "EVENT_TYPE"}
+
+    def damage_usd(value: object) -> float:
+        if value is None or pd.isna(value):
+            return 0.0
+        raw = str(value).strip().replace("$", "").replace(",", "").upper()
+        if not raw:
+            return 0.0
+        multiplier = {"K": 1e3, "M": 1e6, "B": 1e9}.get(raw[-1], 1.0)
+        number = raw[:-1] if multiplier != 1.0 else raw
+        try:
+            return float(number) * multiplier
+        except ValueError:
+            return 0.0
+
+    for source_path in source_files:
+        opener = gzip.open if source_path.name.endswith(".gz") else open
+        with opener(source_path, "rt", encoding="utf-8-sig", errors="replace", newline="") as stream:
+            header = next(csv.reader(stream), [])
+        columns = {str(name).strip().upper(): name for name in header}
+        absent = required - set(columns)
+        if absent:
+            print(f"[skip] {source_path.name}: missing columns {sorted(absent)}")
+            continue
+        usecols = [
+            columns[name]
+            for name in (
+                "EVENT_ID", "EPISODE_ID", "STATE", "STATE_FIPS", "CZ_TYPE", "CZ_FIPS",
+                "CZ_NAME", "EVENT_TYPE", "BEGIN_DATE_TIME", "BEGIN_YEARMONTH",
+                "DAMAGE_PROPERTY", "DAMAGE_CROPS", "EPISODE_NARRATIVE", "EVENT_NARRATIVE",
+            )
+            if name in columns
+        ]
+        for chunk in pd.read_csv(
+            source_path, usecols=usecols, dtype=str, chunksize=200_000,
+            encoding="utf-8-sig", on_bad_lines="warn",
+        ):
+            chunk.columns = [str(name).strip().upper() for name in chunk.columns]
+            if "BEGIN_YEARMONTH" in chunk:
+                year = pd.to_numeric(chunk["BEGIN_YEARMONTH"].str[:4], errors="coerce")
+            else:
+                year = pd.Series(float("nan"), index=chunk.index)
+            if "BEGIN_DATE_TIME" in chunk:
+                fallback = pd.to_datetime(chunk["BEGIN_DATE_TIME"], errors="coerce").dt.year
+                year = year.fillna(fallback)
+            chunk["event_year"] = year
+            chunk = chunk[chunk["event_year"].between(2017, 2025)].copy()
+            if chunk.empty:
+                continue
+            for source, target in (("DAMAGE_PROPERTY", "property_damage_nominal_usd"),
+                                   ("DAMAGE_CROPS", "crop_damage_nominal_usd")):
+                chunk[target] = chunk[source].map(damage_usd) if source in chunk else 0.0
+            state_fips = pd.to_numeric(chunk["STATE_FIPS"], errors="coerce")
+            county_fips = pd.to_numeric(chunk["CZ_FIPS"], errors="coerce")
+            chunk["county_fips"] = ""
+            is_county = chunk["CZ_TYPE"].fillna("").str.strip().str.upper().eq("C")
+            valid_code = is_county & state_fips.notna() & county_fips.notna() & county_fips.gt(0)
+            chunk.loc[valid_code, "county_fips"] = [
+                f"{int(state):02d}{int(county):03d}"
+                for state, county in zip(state_fips[valid_code], county_fips[valid_code])
+            ]
+            direct = chunk[valid_code].copy()
+            unresolved = chunk[~valid_code].copy()
+            if not direct.empty:
+                direct["source_file"] = source_path.name
+                direct_parts.append(direct)
+            if not unresolved.empty:
+                unresolved["assignment_status"] = "unresolved_zone_or_noncounty"
+                unresolved["source_file"] = source_path.name
+                unresolved_parts.append(unresolved)
+            cyclone_text = (
+                chunk.get("EVENT_TYPE", pd.Series("", index=chunk.index)).fillna("")
+                + " " + chunk.get("EPISODE_NARRATIVE", pd.Series("", index=chunk.index)).fillna("")
+                + " " + chunk.get("EVENT_NARRATIVE", pd.Series("", index=chunk.index)).fillna("")
+            )
+            candidate = chunk[cyclone_text.str.contains(
+                r"hurricane|tropical storm|tropical cyclone", case=False, regex=True
+            )].copy()
+            if not candidate.empty:
+                candidate_parts.append(candidate)
+
+    direct = pd.concat(direct_parts, ignore_index=True) if direct_parts else pd.DataFrame()
+    unresolved = pd.concat(unresolved_parts, ignore_index=True) if unresolved_parts else pd.DataFrame()
+    candidates = pd.concat(candidate_parts, ignore_index=True) if candidate_parts else pd.DataFrame()
+    if direct.empty and unresolved.empty:
+        raise RuntimeError("No 2017-2025 NOAA Storm Events records were parsed from supplied files.")
+
+    direct.to_csv(direct_path, index=False)
+    unresolved.to_csv(unresolved_path, index=False)
+    candidate_fields = [
+        name for name in (
+            "EVENT_ID", "EPISODE_ID", "event_year", "STATE", "STATE_FIPS", "CZ_TYPE",
+            "CZ_FIPS", "CZ_NAME", "EVENT_TYPE", "BEGIN_DATE_TIME", "EPISODE_NARRATIVE",
+            "EVENT_NARRATIVE", "property_damage_nominal_usd", "crop_damage_nominal_usd",
+        ) if name in candidates.columns
+    ]
+    candidates = candidates[candidate_fields].drop_duplicates() if candidate_fields else candidates
+    if "EVENT_ID" in candidates:
+        candidates["storm_id"] = ""
+        candidates["review_status"] = "pending_manual_storm_match"
+    candidates.to_csv(candidates_path, index=False)
+
+    reviewed_path = project.paths["reviewed_storm_crosswalk"]
+    matched_count = 0
+    if reviewed_path.is_file() and not direct.empty:
+        reviewed = pd.read_csv(reviewed_path, dtype=str)
+        required_crosswalk = {"EVENT_ID", "storm_id", "reviewed"}
+        if not required_crosswalk.issubset(reviewed.columns):
+            raise ValueError(
+                f"Reviewed crosswalk must contain {sorted(required_crosswalk)}: {reviewed_path}"
+            )
+        approved = reviewed[reviewed["reviewed"].str.lower().isin({"1", "true", "yes"})]
+        matched = direct.merge(approved[["EVENT_ID", "storm_id"]], on="EVENT_ID", how="inner")
+        matched.to_csv(matched_path, index=False)
+        matched_count = len(matched)
+    else:
+        print(f"[pending] Review storm matches in {candidates_path}; no storm IDs inferred automatically.")
+
+    counts = Counter(direct.get("event_year", pd.Series(dtype=int)).dropna().astype(int).tolist())
+    manifest = {
+        "years": [2017, 2025],
+        "source_files": [str(path) for path in source_files],
+        "direct_county_rows": int(len(direct)),
+        "unresolved_zone_or_noncounty_rows": int(len(unresolved)),
+        "storm_match_candidate_rows": int(len(candidates)),
+        "reviewed_county_storm_rows": int(matched_count),
+        "direct_county_rows_by_year": {str(year): counts.get(year, 0) for year in years},
+        "damage_units": "nominal USD as reported by NOAA; not inflation adjusted",
+        "status": "partial: zone-coded rows remain unassigned; storm matches require review",
+    }
+    manifest_path.write_text(__import__("json").dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"[damage] direct county rows: {len(direct)}")
+    print(f"[damage] unresolved geography rows: {len(unresolved)}")
+    print(f"[damage] reviewed county-storm rows: {matched_count}")
+    return {"manifest": str(manifest_path), **manifest}
+
+
+def build_storm_specific_impact_footprints(project) -> dict[str, object]:
+    """Intersect event-specific SLOSH candidate surge, wind swath, counties, study area.
+
+    Surge and wind candidate layers must be normalized upstream to polygon GeoPackages
+    with a shared `storm_id`. This task does not mistake a static SLOSH scenario map
+    for observed historical inundation.
+    """
+    import geopandas as gpd
+    from shapely.ops import unary_union
+
+    def read_layer(path: Path, label: str):
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} missing: {path}")
+        layer = gpd.read_file(path)
+        if layer.crs is None:
+            raise ValueError(f"{label} has no CRS: {path}")
+        if "storm_id" not in layer.columns:
+            raise ValueError(f"{label} requires a storm_id column: {path}")
+        return layer.to_crs("EPSG:5070")
+
+    surge = read_layer(project.paths["surge_candidate_polygons"], "SLOSH surge candidate polygons")
+    wind = read_layer(project.paths["wind_exposure_polygons"], "NHC tropical-storm wind polygons")
+    counties = gpd.read_file(project.paths["county_boundaries"])
+    study = gpd.read_file(project.paths["study_area_boundary"])
+    if counties.crs is None or study.crs is None:
+        raise ValueError("County and study-area boundary layers must declare CRS.")
+    counties = counties.to_crs("EPSG:5070")
+    study = study.to_crs("EPSG:5070")
+    county_columns = {name.upper(): name for name in counties.columns}
+    if "GEOID" in county_columns:
+        county_fips_field = county_columns["GEOID"]
+        counties["county_fips"] = counties[county_fips_field].astype(str).str.zfill(5)
+    elif {"STATEFP", "COUNTYFP"}.issubset(county_columns):
+        counties["county_fips"] = (
+            counties[county_columns["STATEFP"]].astype(str).str.zfill(2)
+            + counties[county_columns["COUNTYFP"]].astype(str).str.zfill(3)
+        )
+    else:
+        raise ValueError("TIGER county layer needs GEOID or STATEFP and COUNTYFP fields.")
+
+    study_geometry = unary_union(study.geometry)
+    county_geometries = [geometry.intersection(study_geometry) for geometry in counties.geometry]
+    ids = sorted(set(surge["storm_id"].dropna().astype(str)) & set(wind["storm_id"].dropna().astype(str)))
+    if not ids:
+        raise ValueError("No shared storm_id values between surge and wind polygon inputs.")
+    rows: list[dict[str, object]] = []
+    county_records = counties[["county_fips"]].to_dict("records")
+    for storm_id in ids:
+        surge_geom = unary_union(surge.loc[surge["storm_id"].astype(str) == storm_id].geometry)
+        wind_geom = unary_union(wind.loc[wind["storm_id"].astype(str) == storm_id].geometry)
+        impact = surge_geom.intersection(wind_geom).intersection(study_geometry)
+        if impact.is_empty:
+            continue
+        for record, county_geom in zip(county_records, county_geometries):
+            if county_geom.is_empty or not county_geom.intersects(impact):
+                continue
+            clipped = impact.intersection(county_geom)
+            if clipped.is_empty or clipped.area <= 0:
+                continue
+            rows.append({
+                "storm_id": storm_id,
+                "county_fips": record["county_fips"],
+                "impact_area_km2": clipped.area / 1_000_000,
+                "footprint_type": "potential_SLOSH_surge_intersected_with_TS_wind_swath",
+                "geometry": clipped,
+            })
+    if not rows:
+        raise RuntimeError("Hazard overlays produced no county-storm footprint features.")
+    result = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:5070")
+    output_path = project.paths["storm_impact_footprints"]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_file(output_path, layer="storm_county_impact", driver="GPKG")
+    print(f"[footprints] wrote {len(result)} storm-county features: {output_path}")
+    print("[interpretation] potential modeled footprint, not observed inundation.")
+    return {"path": str(output_path), "features": len(result), "storm_ids": len(ids)}
+
+
+def calculate_riskproperty_in_footprint(project) -> dict[str, object]:
+    """Area-allocate CBG housing value into potential footprints; label proxy explicitly."""
+    import geopandas as gpd
+    import pandas as pd
+
+    value_path = project.paths["cbg_housing_value_polygons"]
+    footprint_path = project.paths["storm_impact_footprints"]
+    for label, path in (("CBG housing-value polygons", value_path),
+                        ("storm-county impact footprints", footprint_path)):
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} missing: {path}")
+    cbg = gpd.read_file(value_path)
+    footprints = gpd.read_file(footprint_path)
+    if cbg.crs is None or footprints.crs is None:
+        raise ValueError("CBG housing and footprint layers must declare CRS.")
+    cbg = cbg.to_crs("EPSG:5070")
+    footprints = footprints.to_crs("EPSG:5070")
+    columns = {name.lower(): name for name in cbg.columns}
+    cbg_id_field = next((columns[name] for name in ("cbg_fips", "geoid", "geoid20", "geoid10") if name in columns), None)
+    value_field = next((columns[name] for name in (
+        "housing_value_2025usd", "owner_occupied_housing_value_2025usd", "housing_value_2025_usd"
+    ) if name in columns), None)
+    if cbg_id_field is None or value_field is None:
+        raise ValueError("CBG layer needs CBG_FIPS/GEOID and housing_value_2025usd fields.")
+    cbg = cbg[[cbg_id_field, value_field, "geometry"]].copy()
+    cbg = cbg.rename(columns={cbg_id_field: "cbg_fips", value_field: "housing_value_2025usd"})
+    cbg["cbg_fips"] = cbg["cbg_fips"].astype(str).str.zfill(12)
+    cbg["housing_value_2025usd"] = pd.to_numeric(cbg["housing_value_2025usd"], errors="coerce").fillna(0)
+    cbg["cbg_area_m2"] = cbg.geometry.area
+    intersections = gpd.overlay(
+        cbg, footprints[["storm_id", "county_fips", "geometry"]],
+        how="intersection", keep_geom_type=False,
+    )
+    intersections["overlap_area_m2"] = intersections.geometry.area
+    intersections["exposed_area_share"] = (
+        intersections["overlap_area_m2"] / intersections["cbg_area_m2"].replace(0, pd.NA)
+    ).fillna(0).clip(0, 1)
+    intersections["riskproperty_area_weighted_proxy_2025usd"] = (
+        intersections["housing_value_2025usd"] * intersections["exposed_area_share"]
+    )
+    intersections["allocation_method"] = "CBG_total_value_times_intersection_area_share"
+    if intersections.empty:
+        raise RuntimeError("No CBGs intersect potential storm footprints.")
+    output_path = project.paths["riskproperty_intersections"]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    intersections.to_file(output_path, layer="cbg_riskproperty", driver="GPKG")
+    summary_path = project.paths["riskproperty_summary"]
+    summary = (
+        intersections.drop(columns="geometry")
+        .groupby(["storm_id", "county_fips"], as_index=False)
+        ["riskproperty_area_weighted_proxy_2025usd"].sum()
+    )
+    summary.to_csv(summary_path, index=False)
+    print(f"[riskproperty] wrote CBG intersections: {output_path}")
+    print(f"[riskproperty] wrote storm-county summary: {summary_path}")
+    print("[caution] area-weighted CBG housing value is a proxy, not parcel-level value at risk.")
+    return {"intersections": str(output_path), "summary": str(summary_path), "rows": len(intersections)}
+
+
 def prepare_msi_dem_download(project) -> dict[str, str]:
     """Generate an MSI-side resumable downloader; this task does not submit it."""
     script_path = project.paths["msi_dem_download_script"]
@@ -457,6 +761,59 @@ def download_coastal_dem_inputs(config=None, project_root=None, dem_root=None):
         })
         ids = ids_result.get("objectIds") or []
 
+        def esri_feature_to_geojson(feature):
+            from shapely.geometry import Polygon, mapping
+
+            geometry = feature.get("geometry") or {}
+            rings = geometry.get("rings")
+            if not rings:
+                raise RuntimeError("Esri JSON response lacks polygon rings")
+
+            ring_records = []
+            for coordinates in rings:
+                polygon = Polygon(coordinates)
+                if not polygon.is_empty and polygon.area > 0:
+                    ring_records.append((coordinates, polygon))
+            if not ring_records:
+                raise RuntimeError("Esri JSON polygon contains no usable rings")
+
+            parents = []
+            for index, (_, polygon) in enumerate(ring_records):
+                containers = [
+                    other_index
+                    for other_index, (_, other) in enumerate(ring_records)
+                    if other_index != index and other.area > polygon.area
+                    and other.contains(polygon)
+                ]
+                parents.append(
+                    min(containers, key=lambda item: ring_records[item][1].area)
+                    if containers else None
+                )
+
+            depths = []
+            for index in range(len(ring_records)):
+                depth, parent = 0, parents[index]
+                while parent is not None:
+                    depth += 1
+                    parent = parents[parent]
+                depths.append(depth)
+
+            polygons = []
+            for index, (shell, _) in enumerate(ring_records):
+                if depths[index] % 2:
+                    continue
+                holes = [
+                    ring_records[child][0]
+                    for child, parent in enumerate(parents)
+                    if parent == index and depths[child] == depths[index] + 1
+                ]
+                polygon = Polygon(shell, holes)
+                if not polygon.is_empty:
+                    polygons.append(polygon)
+            if not polygons:
+                raise RuntimeError("Could not assemble Esri JSON polygon rings")
+            return mapping(unary_union(polygons))
+
         def fetch_batch(batch):
             try:
                 result = get_json(layer_url + "/query", {
@@ -479,6 +836,28 @@ def download_coastal_dem_inputs(config=None, project_root=None, dem_root=None):
                     flush=True,
                 )
                 return fetch_batch(batch[:midpoint]) + fetch_batch(batch[midpoint:])
+            except Exception as geojson_error:
+                try:
+                    result = get_json(layer_url + "/query", {
+                        "objectIds": str(batch[0]),
+                        "outFields": fields, "returnGeometry": "true", "outSR": "4326",
+                        "f": "json"
+                    })
+                    if result.get("error"):
+                        raise RuntimeError(f"ArcGIS query error: {result['error']}")
+                    return [
+                        {
+                            "type": "Feature",
+                            "properties": item.get("attributes", {}),
+                            "geometry": esri_feature_to_geojson(item),
+                        }
+                        for item in result.get("features", [])
+                    ]
+                except Exception as esri_error:
+                    raise RuntimeError(
+                        f"NOAA ArcGIS feature query failed for objectId {batch[0]} "
+                        f"as GeoJSON ({geojson_error}) and Esri JSON ({esri_error})"
+                    ) from esri_error
 
         features = []
         for start in range(0, len(ids), batch_size):

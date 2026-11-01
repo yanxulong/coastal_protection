@@ -14,6 +14,9 @@ TASK_REGISTRY: dict[str, Callable] = {
     "audit_stormarea_inputs": tasks.audit_stormarea_inputs,
     "prepare_msi_dem_download": tasks.prepare_msi_dem_download,
     "download_nhc_storm_tracks": tasks.download_nhc_storm_tracks,
+    "reconcile_noaa_storm_damage": tasks.reconcile_noaa_storm_damage,
+    "build_storm_specific_impact_footprints": tasks.build_storm_specific_impact_footprints,
+    "calculate_riskproperty_in_footprint": tasks.calculate_riskproperty_in_footprint,
 }
 
 
@@ -101,6 +104,27 @@ def initialize_paths(
         ),
         "dem_tiles": existing_or_default(str(dem_relative / "tiles"), directory=True),
         "stormarea_output": project_root / "data" / "processed" / "stormarea_2017_2025",
+        "storm_events_dir": existing_or_default("data/raw/storm_events", directory=True),
+        "surge_candidate_polygons": existing_or_default(
+            "data/processed/stormarea_2017_2025/surge_candidate_polygons.gpkg"
+        ),
+        "wind_exposure_polygons": existing_or_default(
+            "data/processed/stormarea_2017_2025/wind_exposure_polygons.gpkg"
+        ),
+        "storm_impact_footprints": project_root / "data" / "processed" / "stormarea_2017_2025" / "storm_county_impact_2017_2025.gpkg",
+        "cbg_housing_value_polygons": existing_or_default(
+            "data/processed/cbg_housing_value_2025usd.gpkg"
+        ),
+        "riskproperty_intersections": project_root / "data" / "processed" / "stormarea_2017_2025" / "cbg_riskproperty_2017_2025.gpkg",
+        "riskproperty_summary": output / "tables" / "riskproperty_by_storm_county_2017_2025.csv",
+        "noaa_direct_county_damage": project_root / "data" / "processed" / "stormarea_2017_2025" / "noaa_direct_county_damage_2017_2025.csv",
+        "noaa_unresolved_zone_damage": project_root / "data" / "processed" / "stormarea_2017_2025" / "noaa_unresolved_zone_damage_2017_2025.csv",
+        "storm_crosswalk_candidates": project_root / "data" / "processed" / "stormarea_2017_2025" / "storm_event_crosswalk_candidates_2017_2025.csv",
+        "reviewed_storm_crosswalk": existing_or_default(
+            "data/processed/stormarea_2017_2025/storm_event_storm_crosswalk_reviewed.csv"
+        ),
+        "noaa_reviewed_county_storm_damage": project_root / "data" / "processed" / "stormarea_2017_2025" / "noaa_reviewed_county_storm_damage_2017_2025.csv",
+        "damage_reconciliation_manifest": project_root / "data" / "processed" / "stormarea_2017_2025" / "damage_reconciliation_manifest_2017_2025.json",
         "output": output,
         "figures": output / "figures",
         "tables": output / "tables",

@@ -25,6 +25,21 @@ def download_nhc_storm_tracks(project):
     return functions.download_nhc_storm_tracks(project)
 
 
+def reconcile_noaa_storm_damage(project):
+    """Parse NOAA county-coded loss rows and preserve noncounty rows unresolved."""
+    return functions.reconcile_noaa_storm_damage(project)
+
+
+def build_storm_specific_impact_footprints(project):
+    """Intersect normalized SLOSH surge candidates, wind swaths, counties, and study area."""
+    return functions.build_storm_specific_impact_footprints(project)
+
+
+def calculate_riskproperty_in_footprint(project):
+    """Allocate CBG housing value into storm footprints as an area-weighted proxy."""
+    return functions.calculate_riskproperty_in_footprint(project)
+
+
 
 def download_coastal_dem_inputs(*args, **kwargs):
     """Pipeline task: fetch NOAA shoreline land mask and USGS coastal DEM inputs."""
